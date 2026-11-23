@@ -119,6 +119,10 @@ jobs:
         working-directory: src
         run: pnpm install --frozen-lockfile --filter "@heistcut/desktop..."
 
+      - name: Download the bundled video tools (FFmpeg, Whisper, yt-dlp, Deno)
+        shell: pwsh
+        run: ./scripts/fetch-tools-windows.ps1
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -132,6 +136,7 @@ jobs:
           releaseName: HeistCut Desktop ${{ env.TAG }}
           releaseBody: |
             HeistCut Desktop for Windows (beta). Download the `-setup.exe` below (or the `.msi`).
-            Sign in with your HeistCut account. The macOS version is coming soon.
+            Sign in with your HeistCut account, then drop a video or paste a YouTube / Twitch link:
+            clips are made on your computer and saved in your Videos folder. The macOS version is coming soon.
           releaseDraft: false
           prerelease: false
