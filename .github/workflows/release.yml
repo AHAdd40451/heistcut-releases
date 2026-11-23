@@ -1,0 +1,137 @@
+# Builds HeistCut Desktop for Windows from the private source repo and publishes the installers
+# as a Release (same setup as reposentry-releases). macOS waits for the Apple Developer account.
+#
+# Setup (done once), this repo → Settings → Secrets and variables → Actions:
+#   Secret   SOURCE_DEPLOY_KEY  private half of a READ-ONLY deploy key on AHAdd40451/HeistCut
+#   Variable API_URL            live API, https://api.heistcut.coderivals.ltd
+#
+# Azure Artifact Signing (Windows "Verified publisher"), same values as reposentry-releases
+# with a certificate profile for HeistCut:
+#   Variable AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT, AZURE_CERT_PROFILE
+#   Secret   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+#
+# Release: Actions → "Release desktop app" → Run workflow → version 0.1.0
+#   or: gh workflow run release.yml -f version=0.1.0 -f allow_unsigned=true
+name: Release desktop app
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 0.1.0"
+        required: true
+      source_ref:
+        description: "Branch or tag of the source repo to build"
+        default: main
+      allow_unsigned:
+        description: "Allow an unsigned build (beta / testing)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src/apps/desktop
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+      API_URL: ${{ vars.API_URL }}
+      SIGN_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+      SIGN_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+      SIGN_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
+      ALLOW_UNSIGNED: ${{ github.event.inputs.allow_unsigned }}
+    steps:
+      - name: Check out private source (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: AHAdd40451/HeistCut
+          ref: ${{ github.event.inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: src/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src/apps/desktop/src-tauri -> target
+
+      - name: Check settings
+        shell: bash
+        run: |
+          if [ -z "$API_URL" ]; then echo "::error::Set the API_URL repository variable first"; exit 1; fi
+
+      - name: Set version and live API URL
+        shell: bash
+        run: |
+          V="${VERSION#v}"
+          printf 'VITE_API_URL=%s\n' "$API_URL" > .env.production
+          node -e '
+            const fs = require("fs");
+            const p = "src-tauri/tauri.conf.json";
+            const c = JSON.parse(fs.readFileSync(p, "utf8"));
+            c.version = process.argv[1];
+            const api = process.argv[2].replace(/\/$/, "");
+            c.app.security.csp = c.app.security.csp
+              .replace(/ http:\/\/localhost:\d+/g, "")
+              .replace(/ https:\/\/api\.heistcut\.coderivals\.ltd/g, "")
+              .replace("connect-src ", `connect-src ${api} `);
+            fs.writeFileSync(p, JSON.stringify(c, null, 2));
+            const cargo = "src-tauri/Cargo.toml";
+            fs.writeFileSync(cargo, fs.readFileSync(cargo, "utf8").replace(/^version = ".*"$/m, `version = "${process.argv[1]}"`));
+            console.log("version", c.version, "| csp", c.app.security.csp);
+          ' "$V" "$API_URL"
+          echo "TAG=v$V" >> "$GITHUB_ENV"
+
+      - name: Set up Azure signing
+        shell: bash
+        run: |
+          if [ -z "$SIGN_ENDPOINT" ] || [ -z "$SIGN_ACCOUNT" ] || [ -z "$SIGN_PROFILE" ]; then
+            if [ "$ALLOW_UNSIGNED" = "true" ]; then echo "::warning::Azure signing not set up: this build is UNSIGNED"; exit 0; fi
+            echo "::error::Azure signing is not set up (AZURE_SIGNING_* variables). Set it up, or run with allow_unsigned for a beta build."; exit 1
+          fi
+          cargo install artifact-signing-cli --locked
+          node -e '
+            const fs = require("fs");
+            const p = "src-tauri/tauri.conf.json";
+            const c = JSON.parse(fs.readFileSync(p, "utf8"));
+            const [e, a, prof] = process.argv.slice(1);
+            c.bundle.windows = { ...c.bundle.windows, signCommand: `artifact-signing-cli -e ${e} -a ${a} -c ${prof} -d HeistCut %1` };
+            fs.writeFileSync(p, JSON.stringify(c, null, 2));
+            console.log("signing with", a, "/", prof);
+          ' "$SIGN_ENDPOINT" "$SIGN_ACCOUNT" "$SIGN_PROFILE"
+
+      - name: Install
+        working-directory: src
+        run: pnpm install --frozen-lockfile --filter "@heistcut/desktop..."
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        with:
+          projectPath: src/apps/desktop
+          tauriScript: pnpm tauri
+          tagName: ${{ env.TAG }}
+          releaseName: HeistCut Desktop ${{ env.TAG }}
+          releaseBody: |
+            HeistCut Desktop for Windows (beta). Download the `-setup.exe` below (or the `.msi`).
+            Sign in with your HeistCut account. The macOS version is coming soon.
+          releaseDraft: false
+          prerelease: false
