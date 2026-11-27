@@ -6,6 +6,8 @@
 #   Secret   SOURCE_DEPLOY_KEY  private half of a READ-ONLY deploy key on AHAdd40451/HeistCut
 #   Variable API_URL            live API, https://api.heistcut.coderivals.ltd
 #   Secret   ES_USERNAME, ES_PASSWORD, CREDENTIAL_ID, ES_TOTP_SECRET   SSL.com eSigner, PROD environment
+#   Secret   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD   auto-update signing
+#            (latest.json; installed apps read it from the latest release here)
 # The eSigner secrets are given only to the tauri-action step, as environment variables.
 #
 # Tauri's signCommand hook signs the app .exe before it is packed, the NSIS plugins, the setup .exe,
@@ -180,10 +182,16 @@ jobs:
           ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
           CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
           ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          # Signs the auto-update files (latest.json): installed apps only accept updates built here.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: src/apps/desktop
           tauriScript: pnpm tauri
           tagName: ${{ env.TAG }}
+          # latest.json: installed apps read it from the newest release to update themselves.
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
           releaseName: HeistCut Desktop ${{ env.TAG }}
           releaseBody: |
             HeistCut Desktop for Windows. Download the `-setup.exe` below (or the `.msi`).
@@ -257,4 +265,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "$HAS_SIGNER" != "true" ] && [ "$ALLOW_UNSIGNED" != "true" ]; then exit 1; fi
+          # Installed apps update from latest.json: without it the release stays a draft.
+          if ! gh release view "$TAG" -R "${{ github.repository }}" --json assets -q '.assets[].name' | grep -qx latest.json; then
+            echo "::error::latest.json is missing from the release (auto-update). The release stays a draft."; exit 1
+          fi
           gh release edit "$TAG" -R "${{ github.repository }}" --draft=false --latest
