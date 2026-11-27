@@ -1,0 +1,177 @@
+# Signs and publishes the video tools HeistCut Desktop downloads on first start (Windows):
+# FFmpeg + ffprobe (shared build) and Whisper and yt-dlp in the "core" pack, Deno (YouTube) in
+# the "deno" pack. They live in their own release, "tools-<version>", marked pre-release and never
+# latest, so the website's download page keeps pointing at the app. Only run this when a tool
+# version changes: each run signs every tool again (about 40 eSigner signings).
+#
+# After a run, copy the manifest from the run summary (or the release's tools-manifest.json)
+# into apps/desktop/src/engine/tools-manifest.json in the source repo and release the app:
+# the app only accepts packs with exactly that size and SHA-256.
+#
+# Secrets: SOURCE_DEPLOY_KEY, and ES_USERNAME, ES_PASSWORD, CREDENTIAL_ID, ES_TOTP_SECRET
+# (given only to the "Sign the tools" step, as environment variables).
+# Run: gh workflow run tools-release.yml -R AHAdd40451/heistcut-releases -f version=2026.11.27
+name: Release desktop video tools
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tools version, e.g. 2026.11.27"
+        required: true
+      source_ref:
+        description: "Branch or tag of the source repo (its fetch and pack scripts)"
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  tools:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src/apps/desktop
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+      TAG: tools-${{ github.event.inputs.version }}
+      HAS_SIGNER: ${{ secrets.ES_USERNAME != '' && secrets.ES_PASSWORD != '' && secrets.CREDENTIAL_ID != '' && secrets.ES_TOTP_SECRET != '' }}
+    steps:
+      - name: Check out private source (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: AHAdd40451/HeistCut
+          ref: ${{ github.event.inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+
+      - name: Check the version
+        shell: bash
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$ ]]; then echo "::error::Use a date version like 2026.11.27"; exit 1; fi
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then echo "::error::$TAG already exists: pick a new version"; exit 1; fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download the video tools (FFmpeg, Whisper, yt-dlp, Deno)
+        shell: pwsh
+        run: ./scripts/fetch-tools-windows.ps1
+
+      - name: Set up eSigner code signing (no secrets in this step)
+        shell: pwsh
+        run: |
+          if ($env:HAS_SIGNER -ne 'true') {
+            Write-Output "::error::eSigner secrets are missing (ES_USERNAME, ES_PASSWORD, CREDENTIAL_ID, ES_TOTP_SECRET). The tools are only published signed."; exit 1
+          }
+          # SSL.com CodeSignTool (the same tool sslcom/esigner-codesign runs), production environment
+          $v = 'v1.3.2'
+          $tool = Join-Path $env:RUNNER_TEMP 'CodeSignTool'
+          $zip = Join-Path $env:RUNNER_TEMP 'CodeSignTool.zip'
+          Invoke-WebRequest "https://github.com/SSLcom/CodeSignTool/releases/download/$v/CodeSignTool-$v-windows.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath $tool -Force
+          Set-Content (Join-Path $tool 'conf\code_sign_tool.properties') -Encoding ascii -Value @(
+            'CLIENT_ID=kaXTRACNijSWsFdRKg_KAfD3fqrBlzMbWs6TwWHwAn8',
+            'OAUTH2_ENDPOINT=https://login.ssl.com/oauth2/token',
+            'CSC_API_ENDPOINT=https://cs.ssl.com',
+            'TSA_URL=http://ts.ssl.com',
+            'TSA_LEGACY_URL=http://ts.ssl.com/legacy')
+
+          # Tauri calls this for every Windows file it signs. Secrets come from the environment,
+          # never from the command line Tauri prints. Java is called directly so cmd.exe can't
+          # mangle special characters in the password. Each try is counted in signings.log.
+          $script = Join-Path $env:RUNNER_TEMP 'esign.ps1'
+          @'
+          param([Parameter(Mandatory)][string]$File)
+          $ErrorActionPreference = 'Stop'
+          $tool = Join-Path $env:RUNNER_TEMP 'CodeSignTool'
+          $java = Join-Path $tool 'jdk-11.0.2\bin\java.exe'
+          $jar = Get-ChildItem (Join-Path $tool 'jar') -Filter 'code_sign_tool-*.jar' | Select-Object -First 1
+          $env:CODE_SIGN_TOOL_PATH = $tool
+          Write-Host "Signing $(Split-Path $File -Leaf)"
+          # makensis hands over the uninstaller as nstXXXX.tmp, which CodeSignTool refuses
+          # ("Unsupported file format"): sign a .exe copy and put it back.
+          $target = $File
+          if ([IO.Path]::GetExtension($File).ToLower() -notin '.exe', '.dll', '.msi') {
+            $target = Join-Path $env:RUNNER_TEMP ("esign-" + [guid]::NewGuid().ToString('N') + ".exe")
+            Copy-Item -LiteralPath $File -Destination $target
+          }
+          for ($try = 1; $try -le 3; $try++) {
+            Add-Content (Join-Path $env:RUNNER_TEMP 'signings.log') (Split-Path $File -Leaf)
+            Push-Location $tool
+            try {
+              $out = & $java -Xmx1024M -jar $jar.FullName sign "-username=$env:ES_USERNAME" "-password=$env:ES_PASSWORD" "-credential_id=$env:CREDENTIAL_ID" "-totp_secret=$env:ES_TOTP_SECRET" "-input_file_path=$target" '-override=true' 2>&1 | Out-String
+            } finally { Pop-Location }
+            # CodeSignTool can exit 0 on failure, so trust only the file's signature.
+            $sig = Get-AuthenticodeSignature -FilePath $target
+            if ($sig.Status -eq 'Valid') {
+              if ($target -ne $File) { Copy-Item -LiteralPath $target -Destination $File -Force; Remove-Item -LiteralPath $target }
+              Write-Host "Signed by $($sig.SignerCertificate.Subject)"; exit 0
+            }
+            Write-Host "Try $try failed ($($sig.Status)): $($out.Trim())"
+            Start-Sleep -Seconds (10 * $try)
+          }
+          Write-Error "Could not sign $File"
+          exit 1
+          '@ | Set-Content $script -Encoding utf8
+
+      - name: Sign the tools
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+        run: |
+          $sign = Join-Path $env:RUNNER_TEMP 'esign.ps1'
+          $files = @(Get-ChildItem src-tauri/tools -File | Where-Object { $_.Extension -in '.exe', '.dll' })
+          if ($files.Count -eq 0) { Write-Output "::error::No tools to sign"; exit 1 }
+          foreach ($f in $files) {
+            & pwsh -NoProfile -NonInteractive -File $sign $f.FullName
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::Could not sign $($f.Name)"; exit 1 }
+          }
+          Write-Output "Signed $($files.Count) tools"
+
+      - name: Pack
+        shell: pwsh
+        run: ./scripts/pack-tools-windows.ps1 -Version $env:VERSION -BaseUrl "https://github.com/${{ github.repository }}/releases/download/$env:TAG" -OutDir (Join-Path $env:RUNNER_TEMP 'out')
+
+      - name: Check the packs
+        shell: pwsh
+        run: |
+          # Unzip the packs exactly as the app gets them: every file signed by Code Rivals Ltd with
+          # a timestamp, and the tools start from that folder (DLLs found, FFmpeg has libass).
+          $outDir = Join-Path $env:RUNNER_TEMP 'out'
+          $packDir = Join-Path $env:RUNNER_TEMP 'packs'
+          Get-ChildItem $outDir -Filter *.zip | ForEach-Object { Expand-Archive $_.FullName -DestinationPath $packDir -Force }
+          foreach ($t in @(@('ffmpeg.exe', '-version'), @('ffprobe.exe', '-version'), @('yt-dlp.exe', '--version'), @('deno.exe', '--version'), @('whisper-cli.exe', '--help'))) {
+            & (Join-Path $packDir $t[0]) $t[1] *> $null
+            # whisper-cli --help may exit 1; a missing DLL is a negative (NTSTATUS) code.
+            if ($LASTEXITCODE -lt 0 -or ($t[0] -ne 'whisper-cli.exe' -and $LASTEXITCODE -ne 0)) { Write-Output "::error::$($t[0]) from the tool packs doesn't start (exit $LASTEXITCODE)"; exit 1 }
+          }
+          if (-not (& (Join-Path $packDir 'ffmpeg.exe') -hide_banner -filters 2>$null | Select-String ' ass ')) { Write-Output "::error::FFmpeg in the tool packs has no libass (captions)"; exit 1 }
+          $bad = 0
+          foreach ($f in @(Get-ChildItem $packDir -File)) {
+            if ($f.Extension -notin '.exe', '.dll') { Write-Output "::error::Unexpected file in a pack: $($f.Name)"; $bad++; continue }
+            $s = Get-AuthenticodeSignature -FilePath $f.FullName
+            $who = $s.SignerCertificate.Subject
+            Write-Output ("{0,-32} {1,-8} {2}" -f $f.Name, $s.Status, $who)
+            if ($s.Status -ne 'Valid' -or $who -notmatch 'Code Rivals') { $bad++ }
+            if (-not $s.TimeStamperCertificate) { Write-Output "::error::$($f.Name) has no timestamp"; $bad++ }
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'signings.log'
+          $used = if (Test-Path $log) { @(Get-Content $log).Count } else { 0 }
+          Write-Output "eSigner signings used: $used"
+          if ($bad) { Write-Output "::error::$bad check(s) failed: nothing is published."; exit 1 }
+          $manifest = Get-Content (Join-Path $outDir 'tools-manifest.json') -Raw
+          "### Video tools $env:VERSION`n`neSigner signings used: $used`n`nPut this in ``apps/desktop/src/engine/tools-manifest.json``:`n``````json`n$manifest`n``````" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Publish (pre-release, never latest)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          gh release create "$TAG" "$OUT"/*.zip "$OUT/tools-manifest.json" -R "${{ github.repository }}" \
+            --title "HeistCut Desktop video tools $VERSION" --prerelease --latest=false \
+            --notes "Video tools HeistCut Desktop downloads on first start. Nothing to install by hand: get the app from the latest release."

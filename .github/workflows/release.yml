@@ -8,15 +8,15 @@
 #   Secret   ES_USERNAME, ES_PASSWORD, CREDENTIAL_ID, ES_TOTP_SECRET   SSL.com eSigner, PROD environment
 # The eSigner secrets are given only to the tauri-action step, as environment variables.
 #
-# What gets signed (each file uses one signing from the eSigner monthly allowance, about 32 a build):
-#   1. Every .exe and .dll in src-tauri/tools (FFmpeg, Whisper, yt-dlp, Deno). They ship inside the
-#      installers and Tauri doesn't sign resources, so Tauri's beforeBuildCommand signs them first.
-#   2. Tauri's signCommand hook: the app .exe before it is packed, the NSIS plugins, the setup .exe,
-#      its uninstaller and the .msi.
+# Tauri's signCommand hook signs the app .exe before it is packed, the NSIS plugins, the setup .exe,
+# its uninstaller and the .msi (about 12 eSigner signings a build).
+# The video tools are not in the installers: the app downloads the packs published by
+# tools-release.yml ("tools-<version>"), listed with size and SHA-256 in the source's
+# apps/desktop/src/engine/tools-manifest.json. The check below verifies those packs too.
 #
 # The release is created as a draft and published only after every shipped file is checked.
 # Run: Actions → "Release desktop app" → Run workflow, or
-#   gh workflow run release.yml -R AHAdd40451/heistcut-releases -f version=0.4.3
+#   gh workflow run release.yml -R AHAdd40451/heistcut-releases -f version=0.4.4
 name: Release desktop app
 
 on:
@@ -159,43 +159,19 @@ jobs:
           exit 1
           '@ | Set-Content $script -Encoding utf8
 
-          # Signs the bundled tools with the same script. Runs as part of beforeBuildCommand
-          # (inside the tauri-action step, so the secrets stay in that step only), before
-          # Tauri copies src-tauri/tools into the installers.
-          $tools = Join-Path $env:RUNNER_TEMP 'sign-tools.ps1'
-          @'
-          param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][string]$Sign)
-          $ErrorActionPreference = 'Stop'
-          $files = @(Get-ChildItem $Dir -File | Where-Object { $_.Extension -in '.exe', '.dll' })
-          if ($files.Count -eq 0) { Write-Error "No tools found in $Dir"; exit 1 }
-          foreach ($f in $files) {
-            & pwsh -NoProfile -NonInteractive -File $Sign $f.FullName
-            if ($LASTEXITCODE -ne 0) { Write-Error "Could not sign $($f.Name)"; exit 1 }
-          }
-          Write-Host "Signed $($files.Count) bundled tools"
-          '@ | Set-Content $tools -Encoding utf8
-
-          $toolsDir = Join-Path (Get-Location) 'src-tauri\tools'
           node -e '
             const fs = require("fs");
-            const [script, tools, dir] = process.argv.slice(1);
+            const script = process.argv[1];
             const p = "src-tauri/tauri.conf.json";
             const c = JSON.parse(fs.readFileSync(p, "utf8"));
             c.bundle.windows = { ...c.bundle.windows, signCommand: { cmd: "pwsh", args: ["-NoProfile", "-NonInteractive", "-File", script, "%1"] } };
-            // No quotes: Tauri passes them through literally on Windows. Runner paths have no spaces.
-            if (/\s/.test(script + tools + dir)) throw new Error("signing paths must not contain spaces");
-            c.build.beforeBuildCommand = `${c.build.beforeBuildCommand} && pwsh -NoProfile -NonInteractive -File ${tools} -Dir ${dir} -Sign ${script}`;
             fs.writeFileSync(p, JSON.stringify(c, null, 2));
-            console.log("signing with SSL.com eSigner | beforeBuildCommand:", c.build.beforeBuildCommand);
-          ' "$script" "$tools" "$toolsDir"
+            console.log("signing with SSL.com eSigner");
+          ' "$script"
 
       - name: Install
         working-directory: src
         run: pnpm install --frozen-lockfile --filter "@heistcut/desktop..."
-
-      - name: Download the bundled video tools (FFmpeg, Whisper, yt-dlp, Deno)
-        shell: pwsh
-        run: ./scripts/fetch-tools-windows.ps1
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -221,8 +197,8 @@ jobs:
         if: env.HAS_SIGNER == 'true'
         shell: pwsh
         run: |
-          # Check what ships: the installers, and the app .exe and tools packed inside each of them
-          # (the copies left in target/release are not the ones that ship).
+          # Check what ships: the installers and the app .exe packed inside each of them (the copy
+          # left in target/release is not the one that ships), and the tool packs the app downloads.
           $setup = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *-setup.exe -File | Select-Object -First 1
           $msi = Get-ChildItem src-tauri/target/release/bundle/msi -Filter *.msi -File | Select-Object -First 1
           if (-not $setup -or -not $msi) { Write-Output "::error::The setup .exe or .msi is missing"; exit 1 }
@@ -231,21 +207,39 @@ jobs:
           Start-Process msiexec.exe -Wait -ArgumentList @('/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$out\msi`"")
           $inner = @(Get-ChildItem $out -Recurse -File -Filter heistcut.exe)
           if ($inner.Count -lt 2) { Write-Output "::error::Could not find heistcut.exe inside both installers (found $($inner.Count))"; exit 1 }
-          $toolCount = @(Get-ChildItem src-tauri/tools -File | Where-Object { $_.Extension -in '.exe', '.dll' }).Count
-          $tools = @(Get-ChildItem $out -Recurse -File | Where-Object { $_.Directory.Name -eq 'tools' -and $_.Extension -in '.exe', '.dll' })
-          if ($tools.Count -ne 2 * $toolCount) { Write-Output "::error::Expected $toolCount tools inside each installer, found $($tools.Count) in total"; exit 1 }
+          # The tool packs this build downloads on first start: exactly the manifest's size and
+          # SHA-256, every file signed, and the tools start (DLLs found, FFmpeg has libass).
+          $m = Get-Content src/engine/tools-manifest.json -Raw | ConvertFrom-Json
+          $names = @($m.packs.PSObject.Properties.Name)
+          if ($names.Count -eq 0) { Write-Output "::error::tools-manifest.json lists no tool packs: run the tools release first"; exit 1 }
+          $packDir = Join-Path $env:RUNNER_TEMP 'packs'
+          foreach ($n in $names) {
+            $p = $m.packs.$n
+            $zip = Join-Path $env:RUNNER_TEMP "pack-$n.zip"
+            Invoke-WebRequest $p.url -OutFile $zip
+            $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+            if ((Get-Item $zip).Length -ne $p.size -or $hash -ne $p.sha256) { Write-Output "::error::Tools pack $n doesn't match tools-manifest.json"; exit 1 }
+            Expand-Archive $zip -DestinationPath $packDir -Force
+          }
+          foreach ($t in @(@('ffmpeg.exe', '-version'), @('ffprobe.exe', '-version'), @('yt-dlp.exe', '--version'), @('deno.exe', '--version'), @('whisper-cli.exe', '--help'))) {
+            & (Join-Path $packDir $t[0]) $t[1] *> $null
+            # whisper-cli --help may exit 1; a missing DLL is a negative (NTSTATUS) code.
+            if ($LASTEXITCODE -lt 0 -or ($t[0] -ne 'whisper-cli.exe' -and $LASTEXITCODE -ne 0)) { Write-Output "::error::$($t[0]) from the tool packs doesn't start (exit $LASTEXITCODE)"; exit 1 }
+          }
+          if (-not (& (Join-Path $packDir 'ffmpeg.exe') -hide_banner -filters 2>$null | Select-String ' ass ')) { Write-Output "::error::FFmpeg in the tool packs has no libass (captions)"; exit 1 }
+          $tools = @(Get-ChildItem $packDir -File | Where-Object { $_.Extension -in '.exe', '.dll' })
           # The NSIS uninstaller is only written when the app is installed: install it quietly
           # (current user, own folder) and check the uninstaller it leaves behind.
           $installed = Join-Path $env:RUNNER_TEMP 'installed'
           Start-Process $setup.FullName -Wait -ArgumentList @('/S', "/D=$installed")
           $uninst = @(Get-ChildItem $installed -File -Filter uninstall.exe -ErrorAction SilentlyContinue)
           if ($uninst.Count -ne 1) { Write-Output "::error::The installer left no uninstall.exe in $installed"; exit 1 }
-          $files = @($setup, $msi) + $inner + $tools + $uninst
+          $files = @($setup, $msi) + $inner + $uninst + $tools
           $bad = 0
           foreach ($f in $files) {
             $s = Get-AuthenticodeSignature -FilePath $f.FullName
             $who = $s.SignerCertificate.Subject
-            $label = if ($f.FullName.StartsWith($out)) { "inside " + $f.FullName.Substring($out.Length + 1).Split([char]92)[0] + ": " + $f.Name } elseif ($f.FullName.StartsWith($installed)) { "installed: " + $f.Name } else { $f.Name }
+            $label = if ($f.FullName.StartsWith($out)) { "inside " + $f.FullName.Substring($out.Length + 1).Split([char]92)[0] + ": " + $f.Name } elseif ($f.FullName.StartsWith($installed)) { "installed: " + $f.Name } elseif ($f.FullName.StartsWith($packDir)) { "tool pack: " + $f.Name } else { $f.Name }
             Write-Output ("{0,-45} {1,-8} {2}" -f $label, $s.Status, $who)
             if ($s.Status -ne 'Valid' -or $who -notmatch 'Code Rivals') { $bad++ }
             if (-not $s.TimeStamperCertificate) { Write-Output "::error::$label has no timestamp"; $bad++ }
