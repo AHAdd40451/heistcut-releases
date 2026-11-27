@@ -1,30 +1,35 @@
-# Builds HeistCut Desktop for Windows from the private source repo and publishes the installers
-# as a Release (same setup as reposentry-releases). macOS waits for the Apple Developer account.
+# Builds HeistCut Desktop for Windows from the private source repo, signs it with SSL.com eSigner
+# (publisher "CODE RIVALS LTD") and publishes the installers here, where the website's download
+# page (heistcut.coderivals.ltd/download) reads the latest release.
 #
 # Setup (done once), this repo → Settings → Secrets and variables → Actions:
 #   Secret   SOURCE_DEPLOY_KEY  private half of a READ-ONLY deploy key on AHAdd40451/HeistCut
 #   Variable API_URL            live API, https://api.heistcut.coderivals.ltd
+#   Secret   ES_USERNAME, ES_PASSWORD, CREDENTIAL_ID, ES_TOTP_SECRET   SSL.com eSigner, PROD environment
+# The eSigner secrets are given only to the tauri-action step, as environment variables.
 #
-# Azure Artifact Signing (Windows "Verified publisher"), same values as reposentry-releases
-# with a certificate profile for HeistCut:
-#   Variable AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT, AZURE_CERT_PROFILE
-#   Secret   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+# What gets signed (each file uses one signing from the eSigner monthly allowance, about 32 a build):
+#   1. Every .exe and .dll in src-tauri/tools (FFmpeg, Whisper, yt-dlp, Deno). They ship inside the
+#      installers and Tauri doesn't sign resources, so Tauri's beforeBuildCommand signs them first.
+#   2. Tauri's signCommand hook: the app .exe before it is packed, the NSIS plugins, the setup .exe,
+#      its uninstaller and the .msi.
 #
-# Release: Actions → "Release desktop app" → Run workflow → version 0.1.0
-#   or: gh workflow run release.yml -f version=0.1.0 -f allow_unsigned=true
+# The release is created as a draft and published only after every shipped file is checked.
+# Run: Actions → "Release desktop app" → Run workflow, or
+#   gh workflow run release.yml -R AHAdd40451/heistcut-releases -f version=0.4.3
 name: Release desktop app
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version, e.g. 0.1.0"
+        description: "Version, e.g. 0.4.2"
         required: true
       source_ref:
         description: "Branch or tag of the source repo to build"
         default: main
       allow_unsigned:
-        description: "Allow an unsigned build (beta / testing)"
+        description: "Allow an unsigned build (testing only)"
         type: boolean
         default: false
 
@@ -40,9 +45,7 @@ jobs:
     env:
       VERSION: ${{ github.event.inputs.version }}
       API_URL: ${{ vars.API_URL }}
-      SIGN_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-      SIGN_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-      SIGN_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
+      HAS_SIGNER: ${{ secrets.ES_USERNAME != '' && secrets.ES_PASSWORD != '' && secrets.CREDENTIAL_ID != '' && secrets.ES_TOTP_SECRET != '' }}
       ALLOW_UNSIGNED: ${{ github.event.inputs.allow_unsigned }}
     steps:
       - name: Check out private source (read-only deploy key)
@@ -75,6 +78,7 @@ jobs:
         run: |
           if [ -z "$API_URL" ]; then echo "::error::Set the API_URL repository variable first"; exit 1; fi
 
+      # The version in the source repo stays as it is; this build uses the one from the input.
       - name: Set version and live API URL
         shell: bash
         run: |
@@ -97,23 +101,93 @@ jobs:
           ' "$V" "$API_URL"
           echo "TAG=v$V" >> "$GITHUB_ENV"
 
-      - name: Set up Azure signing
-        shell: bash
+      - name: Set up eSigner code signing
+        shell: pwsh
         run: |
-          if [ -z "$SIGN_ENDPOINT" ] || [ -z "$SIGN_ACCOUNT" ] || [ -z "$SIGN_PROFILE" ]; then
-            if [ "$ALLOW_UNSIGNED" = "true" ]; then echo "::warning::Azure signing not set up: this build is UNSIGNED"; exit 0; fi
-            echo "::error::Azure signing is not set up (AZURE_SIGNING_* variables). Set it up, or run with allow_unsigned for a beta build."; exit 1
-          fi
-          cargo install artifact-signing-cli --locked
+          if ($env:HAS_SIGNER -ne 'true') {
+            if ($env:ALLOW_UNSIGNED -eq 'true') { Write-Output "::warning::eSigner secrets are missing: this build is UNSIGNED"; exit 0 }
+            Write-Output "::error::eSigner secrets are missing (ES_USERNAME, ES_PASSWORD, CREDENTIAL_ID, ES_TOTP_SECRET). Add them, or run with allow_unsigned for a test build."; exit 1
+          }
+          # SSL.com CodeSignTool (the same tool sslcom/esigner-codesign runs), production environment
+          $v = 'v1.3.2'
+          $tool = Join-Path $env:RUNNER_TEMP 'CodeSignTool'
+          $zip = Join-Path $env:RUNNER_TEMP 'CodeSignTool.zip'
+          Invoke-WebRequest "https://github.com/SSLcom/CodeSignTool/releases/download/$v/CodeSignTool-$v-windows.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath $tool -Force
+          Set-Content (Join-Path $tool 'conf\code_sign_tool.properties') -Encoding ascii -Value @(
+            'CLIENT_ID=kaXTRACNijSWsFdRKg_KAfD3fqrBlzMbWs6TwWHwAn8',
+            'OAUTH2_ENDPOINT=https://login.ssl.com/oauth2/token',
+            'CSC_API_ENDPOINT=https://cs.ssl.com',
+            'TSA_URL=http://ts.ssl.com',
+            'TSA_LEGACY_URL=http://ts.ssl.com/legacy')
+
+          # Tauri calls this for every Windows file it signs. Secrets come from the environment,
+          # never from the command line Tauri prints. Java is called directly so cmd.exe can't
+          # mangle special characters in the password. Each try is counted in signings.log.
+          $script = Join-Path $env:RUNNER_TEMP 'esign.ps1'
+          @'
+          param([Parameter(Mandatory)][string]$File)
+          $ErrorActionPreference = 'Stop'
+          $tool = Join-Path $env:RUNNER_TEMP 'CodeSignTool'
+          $java = Join-Path $tool 'jdk-11.0.2\bin\java.exe'
+          $jar = Get-ChildItem (Join-Path $tool 'jar') -Filter 'code_sign_tool-*.jar' | Select-Object -First 1
+          $env:CODE_SIGN_TOOL_PATH = $tool
+          Write-Host "Signing $(Split-Path $File -Leaf)"
+          # makensis hands over the uninstaller as nstXXXX.tmp, which CodeSignTool refuses
+          # ("Unsupported file format"): sign a .exe copy and put it back.
+          $target = $File
+          if ([IO.Path]::GetExtension($File).ToLower() -notin '.exe', '.dll', '.msi') {
+            $target = Join-Path $env:RUNNER_TEMP ("esign-" + [guid]::NewGuid().ToString('N') + ".exe")
+            Copy-Item -LiteralPath $File -Destination $target
+          }
+          for ($try = 1; $try -le 3; $try++) {
+            Add-Content (Join-Path $env:RUNNER_TEMP 'signings.log') (Split-Path $File -Leaf)
+            Push-Location $tool
+            try {
+              $out = & $java -Xmx1024M -jar $jar.FullName sign "-username=$env:ES_USERNAME" "-password=$env:ES_PASSWORD" "-credential_id=$env:CREDENTIAL_ID" "-totp_secret=$env:ES_TOTP_SECRET" "-input_file_path=$target" '-override=true' 2>&1 | Out-String
+            } finally { Pop-Location }
+            # CodeSignTool can exit 0 on failure, so trust only the file's signature.
+            $sig = Get-AuthenticodeSignature -FilePath $target
+            if ($sig.Status -eq 'Valid') {
+              if ($target -ne $File) { Copy-Item -LiteralPath $target -Destination $File -Force; Remove-Item -LiteralPath $target }
+              Write-Host "Signed by $($sig.SignerCertificate.Subject)"; exit 0
+            }
+            Write-Host "Try $try failed ($($sig.Status)): $($out.Trim())"
+            Start-Sleep -Seconds (10 * $try)
+          }
+          Write-Error "Could not sign $File"
+          exit 1
+          '@ | Set-Content $script -Encoding utf8
+
+          # Signs the bundled tools with the same script. Runs as part of beforeBuildCommand
+          # (inside the tauri-action step, so the secrets stay in that step only), before
+          # Tauri copies src-tauri/tools into the installers.
+          $tools = Join-Path $env:RUNNER_TEMP 'sign-tools.ps1'
+          @'
+          param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][string]$Sign)
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem $Dir -File | Where-Object { $_.Extension -in '.exe', '.dll' })
+          if ($files.Count -eq 0) { Write-Error "No tools found in $Dir"; exit 1 }
+          foreach ($f in $files) {
+            & pwsh -NoProfile -NonInteractive -File $Sign $f.FullName
+            if ($LASTEXITCODE -ne 0) { Write-Error "Could not sign $($f.Name)"; exit 1 }
+          }
+          Write-Host "Signed $($files.Count) bundled tools"
+          '@ | Set-Content $tools -Encoding utf8
+
+          $toolsDir = Join-Path (Get-Location) 'src-tauri\tools'
           node -e '
             const fs = require("fs");
+            const [script, tools, dir] = process.argv.slice(1);
             const p = "src-tauri/tauri.conf.json";
             const c = JSON.parse(fs.readFileSync(p, "utf8"));
-            const [e, a, prof] = process.argv.slice(1);
-            c.bundle.windows = { ...c.bundle.windows, signCommand: `artifact-signing-cli -e ${e} -a ${a} -c ${prof} -d HeistCut %1` };
+            c.bundle.windows = { ...c.bundle.windows, signCommand: { cmd: "pwsh", args: ["-NoProfile", "-NonInteractive", "-File", script, "%1"] } };
+            // No quotes: Tauri passes them through literally on Windows. Runner paths have no spaces.
+            if (/\s/.test(script + tools + dir)) throw new Error("signing paths must not contain spaces");
+            c.build.beforeBuildCommand = `${c.build.beforeBuildCommand} && pwsh -NoProfile -NonInteractive -File ${tools} -Dir ${dir} -Sign ${script}`;
             fs.writeFileSync(p, JSON.stringify(c, null, 2));
-            console.log("signing with", a, "/", prof);
-          ' "$SIGN_ENDPOINT" "$SIGN_ACCOUNT" "$SIGN_PROFILE"
+            console.log("signing with SSL.com eSigner | beforeBuildCommand:", c.build.beforeBuildCommand);
+          ' "$script" "$tools" "$toolsDir"
 
       - name: Install
         working-directory: src
@@ -126,17 +200,67 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
         with:
           projectPath: src/apps/desktop
           tauriScript: pnpm tauri
           tagName: ${{ env.TAG }}
           releaseName: HeistCut Desktop ${{ env.TAG }}
           releaseBody: |
-            HeistCut Desktop for Windows (beta). Download the `-setup.exe` below (or the `.msi`).
+            HeistCut Desktop for Windows. Download the `-setup.exe` below (or the `.msi`).
             Sign in with your HeistCut account, then drop a video or paste a YouTube / Twitch link:
             clips are made on your computer and saved in your Videos folder. The macOS version is coming soon.
-          releaseDraft: false
+          # Stays a draft until the signature check below passes.
+          releaseDraft: true
           prerelease: false
+
+      - name: Check the Windows signatures
+        if: env.HAS_SIGNER == 'true'
+        shell: pwsh
+        run: |
+          # Check what ships: the installers, and the app .exe and tools packed inside each of them
+          # (the copies left in target/release are not the ones that ship).
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *-setup.exe -File | Select-Object -First 1
+          $msi = Get-ChildItem src-tauri/target/release/bundle/msi -Filter *.msi -File | Select-Object -First 1
+          if (-not $setup -or -not $msi) { Write-Output "::error::The setup .exe or .msi is missing"; exit 1 }
+          $out = Join-Path $env:RUNNER_TEMP 'unpacked'
+          7z x $setup.FullName "-o$out\nsis" -y | Out-Null
+          Start-Process msiexec.exe -Wait -ArgumentList @('/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$out\msi`"")
+          $inner = @(Get-ChildItem $out -Recurse -File -Filter heistcut.exe)
+          if ($inner.Count -lt 2) { Write-Output "::error::Could not find heistcut.exe inside both installers (found $($inner.Count))"; exit 1 }
+          $toolCount = @(Get-ChildItem src-tauri/tools -File | Where-Object { $_.Extension -in '.exe', '.dll' }).Count
+          $tools = @(Get-ChildItem $out -Recurse -File | Where-Object { $_.Directory.Name -eq 'tools' -and $_.Extension -in '.exe', '.dll' })
+          if ($tools.Count -ne 2 * $toolCount) { Write-Output "::error::Expected $toolCount tools inside each installer, found $($tools.Count) in total"; exit 1 }
+          # The NSIS uninstaller is only written when the app is installed: install it quietly
+          # (current user, own folder) and check the uninstaller it leaves behind.
+          $installed = Join-Path $env:RUNNER_TEMP 'installed'
+          Start-Process $setup.FullName -Wait -ArgumentList @('/S', "/D=$installed")
+          $uninst = @(Get-ChildItem $installed -File -Filter uninstall.exe -ErrorAction SilentlyContinue)
+          if ($uninst.Count -ne 1) { Write-Output "::error::The installer left no uninstall.exe in $installed"; exit 1 }
+          $files = @($setup, $msi) + $inner + $tools + $uninst
+          $bad = 0
+          foreach ($f in $files) {
+            $s = Get-AuthenticodeSignature -FilePath $f.FullName
+            $who = $s.SignerCertificate.Subject
+            $label = if ($f.FullName.StartsWith($out)) { "inside " + $f.FullName.Substring($out.Length + 1).Split([char]92)[0] + ": " + $f.Name } elseif ($f.FullName.StartsWith($installed)) { "installed: " + $f.Name } else { $f.Name }
+            Write-Output ("{0,-45} {1,-8} {2}" -f $label, $s.Status, $who)
+            if ($s.Status -ne 'Valid' -or $who -notmatch 'Code Rivals') { $bad++ }
+            if (-not $s.TimeStamperCertificate) { Write-Output "::error::$label has no timestamp"; $bad++ }
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'signings.log'
+          $used = if (Test-Path $log) { @(Get-Content $log).Count } else { 0 }
+          Write-Output "eSigner signings used by this build: $used"
+          if ($bad) { Write-Output "::error::$bad check(s) failed: not every file is signed by Code Rivals Ltd with a timestamp. The release stays a draft."; exit 1 }
+          $sig = Get-AuthenticodeSignature -FilePath $setup.FullName
+          "### Windows publisher`n``$($sig.SignerCertificate.GetNameInfo('SimpleName', $false))```n`neSigner signings used: $used ($($files.Count) shipped files checked)" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$HAS_SIGNER" != "true" ] && [ "$ALLOW_UNSIGNED" != "true" ]; then exit 1; fi
+          gh release edit "$TAG" -R "${{ github.repository }}" --draft=false --latest
